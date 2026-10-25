@@ -1,0 +1,262 @@
+name: Verify private mobile speed source
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Commit of worldneedme/ish-cdn-speed-test to verify
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: worldneedme/ish-cdn-speed-test
+          ref: ${{ inputs.source_sha }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - name: Install CI-only test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq shellcheck
+      - name: Check POSIX shell syntax
+        run: sh -n tools/ish_vless_speed.sh tests/test-speed.sh
+      - name: Lint shell scripts
+        run: shellcheck -x -s sh tools/ish_vless_speed.sh tests/test-speed.sh
+      - name: Test candidate parsing, profile routing, and download results
+        run: sh tests/test-speed.sh
+      - name: Test authoritative selection, exact ports, provenance and private guide patch
+        run: python3 tests/test_candidates.py
+
+  real-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: worldneedme/ish-cdn-speed-test
+          ref: ${{ inputs.source_sha }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: worldneedme/ish-cdn-speed-test
+          ref: ci-snapshots
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: .ci-snapshots
+      - name: Install CI-only tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq busybox strace nginx clang lld meson ninja-build libarchive-dev libsqlite3-dev
+      - uses: actions/checkout@v4
+        with:
+          repository: SagerNet/sing-box
+          ref: 7054cac5124465ffdb145870d7c01885566711b1
+          path: upstream
+      - uses: actions/checkout@v4
+        with:
+          repository: ish-app/ish
+          ref: c5ebcabec14f1d8709e91e1905ce0edd7cb9c13c
+          submodules: recursive
+          path: ish-source
+      - name: Preserve the old runtime for the real iSH regression
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp tools/ish_vless_speed.sh "$RUNNER_TEMP/cf_speed.sh"
+          cp .ci-snapshots/snapshot/sing-box-linux-386-musl-r3.tar.gz "$RUNNER_TEMP/sing-box-linux-386-musl.tar.gz"
+          mv "$RUNNER_TEMP/sing-box-linux-386-musl.tar.gz" "$RUNNER_TEMP/runtime.tar.gz"
+          echo "d55df0d22aa9b87ada5b16d0a7feb92caf4b68ccdb5e77280cb74350f7f05413  $RUNNER_TEMP/runtime.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/runtime.tar.gz" -C "$RUNNER_TEMP"
+          cp "$RUNNER_TEMP/sing-box-1.14.3-linux-386-musl/sing-box" "$RUNNER_TEMP/old-sing-box"
+      - uses: actions/cache/restore@v4
+        id: ish-core
+        with:
+          path: ${{ runner.temp }}/sing-box-1.14.3-linux-386-musl
+          key: ish-go1.25.13-sb7054cac-with_utls-v1-${{ hashFiles('ci/ish_accept.go', 'ci/prepare_mobile_runtime.py') }}
+      - name: Build the iSH accept4-compatible runtime on the hosted runner
+        if: steps.ish-core.outputs.cache-hit != 'true'
+        run: |
+          python3 ci/prepare_mobile_runtime.py upstream
+          cp ci/ish_accept.go upstream/cmd/sing-box/ish_accept.go
+          docker run --rm --platform linux/386 -v "$PWD:/workspace" -v "$RUNNER_TEMP:/output" \
+            -w /workspace/upstream golang:1.25.13-alpine sh -ec '
+              apk add --no-cache build-base python3
+              CGO_ENABLED=1 GOOS=linux GOARCH=386 GO386=softfloat go build -trimpath -tags with_utls \
+                -ldflags "-s -w -linkmode external -extldflags=-static -checklinkname=0 -X github.com/sagernet/sing-box/constant.Version=1.14.3-mobile-r12" \
+                -o /output/sing-box-1.14.3-linux-386-musl/sing-box ./cmd/sing-box
+            '
+      - uses: actions/cache/save@v4
+        if: steps.ish-core.outputs.cache-hit != 'true'
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/sing-box-1.14.3-linux-386-musl
+          key: ${{ steps.ish-core.outputs.cache-primary-key }}
+      - name: Verify and render the current script with its pinned runtime
+        run: |
+          file "$RUNNER_TEMP/sing-box-1.14.3-linux-386-musl/sing-box"
+          if readelf -l "$RUNNER_TEMP/sing-box-1.14.3-linux-386-musl/sing-box" | grep INTERP; then
+            echo 'iSH runtime must be fully static'
+            exit 1
+          fi
+          tar -czf "$RUNNER_TEMP/runtime.tar.gz" -C "$RUNNER_TEMP" sing-box-1.14.3-linux-386-musl/sing-box
+          python3 ci/render_mobile_release.py "$RUNNER_TEMP/cf_speed.sh" \
+            "$RUNNER_TEMP/sing-box-1.14.3-linux-386-musl/sing-box" "$RUNNER_TEMP/runtime.tar.gz"
+      - uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: ish-runtime-candidate
+          path: |
+            ${{ runner.temp }}/runtime.tar.gz
+            ${{ runner.temp }}/cf_speed.sh
+          retention-days: 3
+      - name: Build the actual iSH syscall emulator and reproduce the phone failure
+        run: |
+          CC=clang meson setup ish-build ish-source -Dengine=asbestos -Dkernel=ish -Dno_crlf=true --buildtype=release
+          ninja -C ish-build
+          curl -fL --retry 2 -o "$RUNNER_TEMP/alpine-rootfs.tar.gz" \
+            https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86/alpine-minirootfs-3.22.2-x86.tar.gz
+          echo "5d7f5078a759c0c72651a68e0e236390b680b66343d526c9c75258dd5ded0964  $RUNNER_TEMP/alpine-rootfs.tar.gz" | sha256sum -c -
+          python3 ci/ish_probe.py ish-build "$RUNNER_TEMP/alpine-rootfs.tar.gz" \
+            "$RUNNER_TEMP/old-sing-box" "$RUNNER_TEMP/sing-box-1.14.3-linux-386-musl/sing-box" "$RUNNER_TEMP/cf_speed.sh"
+      - name: Verify real interrupted transfers, persistent resume, and Nginx range routes
+        run: python3 ci/download_probe.py "$RUNNER_TEMP/runtime.tar.gz" "$RUNNER_TEMP/cf_speed.sh"
+      - name: Exercise actual SOCKS and VLESS download with distinct endpoint ports
+        run: |
+          strace -ff -e trace=socket,socketcall -o "$RUNNER_TEMP/mobile-sockets" \
+            python3 ci/runtime_probe.py "$RUNNER_TEMP/sing-box-1.14.3-linux-386-musl/sing-box" "$RUNNER_TEMP/cf_speed.sh" "$RUNNER_TEMP/runtime.tar.gz"
+          if grep -H 'AF_NETLINK' "$RUNNER_TEMP"/mobile-sockets*; then
+            echo 'SOCKS-only runtime unexpectedly attempted a netlink socket'
+            exit 1
+          fi
+      - name: Verify both public Android mirrors serve the exact pinned archive
+        run: |
+          for mirror in https://ghfast.top https://gh-proxy.org; do
+            curl -fL --connect-timeout 10 --max-time 90 --retry 1 \
+              "$mirror/https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-android-arm64.tar.gz" \
+              -o "$RUNNER_TEMP/android-mirror.tar.gz"
+            echo "149569b5dbf01958e6598beb3a13078d6fc0e353ef06f4aff85f5f28bc23593b  $RUNNER_TEMP/android-mirror.tar.gz" | sha256sum -c -
+            rm "$RUNNER_TEMP/android-mirror.tar.gz"
+          done
+      - name: Publish minimal scripts for deployment
+        run: |
+          mkdir "$RUNNER_TEMP/mobile-scripts"
+          cp "$RUNNER_TEMP/cf_speed.sh" "$RUNNER_TEMP/mobile-scripts/cf_speed.sh"
+          cp "$RUNNER_TEMP/cf_speed.sh" "$RUNNER_TEMP/mobile-scripts/cft_speed.sh"
+          cp MOBILE_GUIDE.md deploy/mobile-downloads.conf "$RUNNER_TEMP/mobile-scripts/"
+          cp tools/cf_speed_windows.ps1 "$RUNNER_TEMP/mobile-scripts/"
+          cp deploy/update_mobile_portal.py "$RUNNER_TEMP/mobile-scripts/"
+          cp "$RUNNER_TEMP/runtime.tar.gz" "$RUNNER_TEMP/mobile-scripts/sing-box-linux-386-musl.tar.gz"
+      - name: Export the authoritative source snapshot on GitHub only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir "$RUNNER_TEMP/source-snapshot"
+          cp .ci-snapshots/snapshot/catalog.json .ci-snapshots/snapshot/cloudfront-*.txt \
+            .ci-snapshots/snapshot/portal-*.* "$RUNNER_TEMP/source-snapshot/"
+          cd "$RUNNER_TEMP/source-snapshot"
+          echo '300fb9dacc752d9ce1abc406e11d98f9e779685825a0c94698c0f1276a7d894a  catalog.json' | sha256sum -c -
+          echo '297283bf87cc9cf26e5f723c107963660fd6057e9f266aee136aa837d16da896  cloudfront-cn.txt' | sha256sum -c -
+          echo 'e863d34c65023095072ec122089e8ad9df94424ff66d59dd0fc014b2b86d8b6a  cloudfront-hk.txt' | sha256sum -c -
+          echo 'c7ed9ac979e696e22c6f2fc6a2d50e188fcfc61fdec7e00827d6aa5da0a2b5ac  portal-app.html' | sha256sum -c -
+          echo 'a62ab4ecd65327264a2dfd70f91caa6daaccf574a8012f9f2efe0ca656fe07ef  portal-server.py' | sha256sum -c -
+          cd "$GITHUB_WORKSPACE"
+          python3 tests/test_candidates.py
+          python3 tools/export_mobile_candidates.py \
+            "$RUNNER_TEMP/source-snapshot/catalog.json" \
+            "$RUNNER_TEMP/source-snapshot/cloudfront-cn.txt" \
+            "$RUNNER_TEMP/source-snapshot/cloudfront-hk.txt" \
+            "$RUNNER_TEMP/mobile-scripts"
+          cp "$RUNNER_TEMP/mobile-scripts/cft_all_selected.txt" "$RUNNER_TEMP/mobile-scripts/cf_all_verified_ips.txt"
+      - name: Check real CDN upstream downloads with the existing private UUID
+        env:
+          CF_SPEED_UUID: ${{ secrets.MOBILE_VERIFY_UUID }}
+        run: |
+          python3 ci/live_mobile_probe.py \
+            "$RUNNER_TEMP/sing-box-1.14.3-linux-386-musl/sing-box" \
+            "$RUNNER_TEMP/cf_speed.sh" "$RUNNER_TEMP/mobile-scripts"
+      - name: Verify the real portal template and phone copy workflow
+        run: |
+          python3 -m pip install playwright==1.55.0
+          python3 -m playwright install chromium --with-deps
+          mkdir -p "$RUNNER_TEMP/portal/templates" "$RUNNER_TEMP/portal/assets/mobile"
+          cp "$RUNNER_TEMP/source-snapshot/portal-app.html" "$RUNNER_TEMP/portal/templates/app.html"
+          cp "$RUNNER_TEMP/source-snapshot/portal-server.py" "$RUNNER_TEMP/portal/server.py"
+          cp "$RUNNER_TEMP/mobile-scripts/"*.txt "$RUNNER_TEMP/mobile-scripts/selected_manifest.json" "$RUNNER_TEMP/portal/assets/mobile/"
+          cp "$RUNNER_TEMP/mobile-scripts/cf_speed_windows.ps1" "$RUNNER_TEMP/portal/assets/mobile/"
+          python3 deploy/update_mobile_portal.py "$RUNNER_TEMP/portal"
+          python3 ci/portal_probe.py "$RUNNER_TEMP/portal" "$RUNNER_TEMP/portal-screens"
+      - name: Keep verified deployment files briefly
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobile-deploy
+          retention-days: 3
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/mobile-scripts/sing-box-linux-386-musl.tar.gz
+            ${{ runner.temp }}/mobile-scripts/cf_speed.sh
+            ${{ runner.temp }}/mobile-scripts/cft_speed.sh
+            ${{ runner.temp }}/mobile-scripts/cf_selected.txt
+            ${{ runner.temp }}/mobile-scripts/cf_trinet_selected.txt
+            ${{ runner.temp }}/mobile-scripts/cf_all_verified_ips.txt
+            ${{ runner.temp }}/mobile-scripts/cft_cn_selected.txt
+            ${{ runner.temp }}/mobile-scripts/cft_hk_selected.txt
+            ${{ runner.temp }}/mobile-scripts/cft_all_selected.txt
+            ${{ runner.temp }}/mobile-scripts/selected_manifest.json
+            ${{ runner.temp }}/mobile-scripts/MOBILE_GUIDE.md
+            ${{ runner.temp }}/mobile-scripts/update_mobile_portal.py
+            ${{ runner.temp }}/mobile-scripts/cf_speed_windows.ps1
+            ${{ runner.temp }}/portal-screens/desktop.png
+            ${{ runner.temp }}/portal-screens/phone.png
+
+  android-termux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: worldneedme/ish-cdn-speed-test
+          ref: ${{ inputs.source_sha }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: worldneedme/ish-cdn-speed-test
+          ref: ci-snapshots
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: .ci-snapshots
+      - name: Enable Android emulator acceleration
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Download pinned Android core and Termux app in CI only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir "$RUNNER_TEMP/android-probe"
+          cd "$RUNNER_TEMP/android-probe"
+          curl -fL --retry 2 -o termux.apk 'https://github.com/termux/termux-app/releases/download/v0.118.3/termux-app_v0.118.3%2Bgithub-debug_x86_64.apk'
+          echo '3550e61f4d9eb49b712fd1bd9519dc37085a4d8eb597c57a340f0a64859b7144  termux.apk' | sha256sum -c -
+          curl -fL --retry 2 -o android.tar.gz 'https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-android-amd64.tar.gz'
+          echo 'a84a5aea86ad0588b76e23051e9e59405a7ed52358acfb9710cfaa055fe60e4a  android.tar.gz' | sha256sum -c -
+          tar -xzf android.tar.gz
+          cp "$GITHUB_WORKSPACE/.ci-snapshots/snapshot/sing-box-linux-386-musl-r3.tar.gz" sing-box-linux-386-musl.tar.gz
+          echo 'd55df0d22aa9b87ada5b16d0a7feb92caf4b68ccdb5e77280cb74350f7f05413  sing-box-linux-386-musl.tar.gz' | sha256sum -c -
+          tar -xzf sing-box-linux-386-musl.tar.gz
+      - name: Exercise both scripts inside unprivileged Termux on Android 35
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          target: default
+          disable-animations: true
+          script: python3 ci/android_probe.py "$RUNNER_TEMP/android-probe" tools/ish_vless_speed.sh
